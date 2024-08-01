@@ -1,0 +1,36 @@
+{
+  "train_file": "/media/mike/NVME2/fineweb100B/fineweb_train_*.bin",
+  "dev_file": "/media/mike/NVME2/fineweb100B/fineweb_val_*.bin",
+  "out_dir": "/media/mike/NVME2/log_gpt2_124M_fp16_3",
+  "val_loss_every": 250,
+  "sample_every": 20000,
+  "num_tokens_to_sample": 144,
+  "run_hellaswag": 1,
+  "batch_size": 48,
+  "total_tokens_per_step": 491520,
+  "seq_len": 1024,
+  "use_act_recomputation": 0,
+  "weight_decay": 0.1,
+  "learning_rate": 6e-4,
+  "lr_decay_final_percentage": 0.0,
+  "lr_warmup_iters": 3500,
+  "checkpoint_every": 1000,
+  "resume_optimization": 1,
+  "load_weights": "d12",
+  "wandb_project": "gpt2_124M_llm.c",
+  "compile_no_multi_gpu": true,
+  "num_gpus": 1,
+  "compile_use_cudnn": true,
+  "apply_overclock": true,
+  "overclocks": {
+    "NVIDIA GeForce RTX 4090": {
+      "core_mhz+": 0,
+      "mem_mhz+": 0
+    }
+  },
+  "enable_wandb": true,
+  "fp_precision": "FP16",
+  "max_loss_outlier": 3.0,
+  "max_norm_outlier": 3.0,
+  "gelu_fusion": 2
+}

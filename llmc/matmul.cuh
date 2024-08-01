@@ -10,6 +10,8 @@ Matrix Multiplication, with help from cuBLASLt
 // GELU can be either fused (cublasLt) or non-fused (gelu.h)
 #include "gelu.cuh"
 
+#include "triton_matmul/triton_matmul_kernels.h"
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -227,17 +229,182 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cudaCheck(cudaGetLastError());
 }
 
+// NOTE: matmul_triton computes A @ B row column major layout, which means matmul_triton and matmul_cublaslt can not be used interchangably!
+void matmul_triton(floatX *d, const floatX *a, const floatX *b, const floatX *bias,
+                   int m, int n, int k, cudaStream_t stream = nullptr, bool transA = true, bool transB = false,
+                   int batch_count = 0, size_t strideA = 0, size_t strideB = 0, size_t strideOut = 0,
+                   bool accumulate = false, floatX *pre_gelu = nullptr, bool backward = false) {
+
+    // TODO: Not yet supported
+    assert(batch_count == 0);
+
+    static bool kernels_loaded = false;
+
+    static CUmodule cuda_modules[NUM_MATMUL_KERNEL_PERMUTATIONS] = {};
+    static CUfunction cuda_functions[NUM_MATMUL_KERNEL_PERMUTATIONS] = {};
+
+    // load kernels on first invocation
+    if (!kernels_loaded) {
+        for (int i = 0; i < NUM_MATMUL_KERNEL_PERMUTATIONS; i++) {
+            const std::string &kernel_source = TRITON_MATMUL_KERNEL_PTX_SOURCES[i];
+            if (CUresult status
+                        = cuModuleLoadDataEx(cuda_modules + i, kernel_source.c_str(), 0, nullptr, nullptr);
+                    status != CUDA_SUCCESS) {
+                auto error = (cudaError_t) status;
+                printf("%d\n", error);
+                return;
+            }
+        }
+
+        for (int i = 0; i < NUM_MATMUL_KERNEL_PERMUTATIONS; i++) {
+            const std::string &kernel_name = TRITON_MATMUL_KERNEL_FUNCTION_NAMES[i];
+            CUfunction *function = cuda_functions + i;
+            if (CUresult status
+                        = cuModuleGetFunction(function, cuda_modules[i], kernel_name.c_str());
+                    status != CUDA_SUCCESS) {
+                auto error = (cudaError_t) status;
+                printf("%d\n", error);
+                return;
+            }
+
+            // set dynamic shared memory if necessary
+            if (TRITON_MATMUL_KERNEL_SHARED_MEMORY_SIZES[i] >= 49152) {
+                CUdevice device{};
+                cuDeviceGet(&device, 0); // TODO: HACK
+
+                int shared_optin{};
+                cudaCheck(cuDeviceGetAttribute(&shared_optin,
+                                                CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                                                device));
+                if (shared_optin >= 49152) {
+                    cudaCheck(cuFuncSetCacheConfig(*function, CU_FUNC_CACHE_PREFER_SHARED));
+
+                    int shared_total{}, shared_static{};
+                    cudaCheck(cuDeviceGetAttribute(&shared_total,
+                                                    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, device));
+
+                    cudaCheck(cuFuncGetAttribute(
+                            &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, *function));
+
+                    cudaCheck(cuFuncSetAttribute(*function,
+                                                  CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                                  shared_optin - shared_static));
+                }
+            }
+        }
+        kernels_loaded = true;
+    }
+    bool use_bias = bias != nullptr;
+    bool fuse_gelu = pre_gelu != nullptr;
+
+    int kernel_idx = static_cast<int>(accumulate) + (2 * static_cast<int>(transA)) + (4 * static_cast<int>(transB)) +
+                     (8 * static_cast<int>(use_bias)) + (16 * static_cast<int>(fuse_gelu)) + (16 * static_cast<int>(backward && fuse_gelu));
+
+    CUfunction kernel_function = cuda_functions[kernel_idx];
+
+    int block_size_m = TRITON_MATMUL_KERNEL_BLOCK_SIZES_M[kernel_idx];
+    int block_size_n = TRITON_MATMUL_KERNEL_BLOCK_SIZES_N[kernel_idx];
+
+    int num_warps = TRITON_MATMUL_KERNEL_NUM_WARPS[kernel_idx];
+    int shared_memory_size = TRITON_MATMUL_KERNEL_SHARED_MEMORY_SIZES[kernel_idx];
+
+    // define grid
+    unsigned int gridX = ((m + block_size_m - 1) / block_size_m) *
+                         ((n + block_size_n - 1) / block_size_n);
+
+    auto stride_am = transA ? 1 : k;
+    auto stride_ak = transA ? m : 1;
+
+    auto stride_bk = transB ? 1 : n;
+    auto stride_bn = transB ? k : 1;
+
+    auto stride_cm = n;
+    auto stride_cn = 1;
+
+    // signature:
+    // u64 a_ptr, u64 b_ptr, u64 c_ptr,
+    // <opt: u64 bias_ptr>, <opt: u64 aux_ptr>, 
+    // u32 m, u32 n, u32 k,
+    // u32 stride_am, u32 stride_ak,
+    // u32 stride_bk, u32 stride_bn,
+    // u32 stride_cm, u32 stride_cn
+
+    int *stride_params[6] = {
+            &stride_am, &stride_ak,
+            &stride_bk, &stride_bn,
+            &stride_cm, &stride_cn
+    };
+    std::vector<void *> parameters{
+            &a, &b, &d
+    };
+
+    // NOTE: Triton automatically inlines parameters that are 0 or 1, even though they are not constexpr!
+    // Therefore we have to dynamically parameters them depending on the kernel permutation
+    if (bias != nullptr) {
+        parameters.push_back(&bias);
+    }
+
+    if (pre_gelu != nullptr) {
+        parameters.push_back(&pre_gelu);
+    }
+
+    parameters.push_back(&m);
+    parameters.push_back(&n);
+    parameters.push_back(&k);
+
+    // Handling of inlining of stride parameters that are one
+    int n_inlined = 0;
+    for (int *stride: stride_params) {
+        if (*stride != 1) {
+            parameters.push_back(stride);
+            n_inlined++;
+        }
+    }
+    assert(n_inlined == 3);
+    cudaCheck(cuLaunchKernel(kernel_function,
+                   gridX, 1, 1,
+                   32 * num_warps, 1, 1,
+                   shared_memory_size,
+                   stream,
+                   parameters.data(),
+                   nullptr));
+}
+
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     floatX* pre_gelu=NULL, int gelu_fusion=1, bool use_lp_accumulator=true) {
+
+    // Weirdness warning: cuBLASLt expects column-major layout, but the rest of the code uses row-major layout!
+    // logical shapes:
+    // weight: (OC, C)
+    // inp: (B*T, C)
+
+    // memory layout = column-major, hence physical shapes:
+    // weight: (C, OC)
+    // inp: (C, B*T)
+
+    // (C, OC).T @ (C, B*T) = (OC, B*T) in column-major
+
+    // comumn-major output is misinterpreted as row-major -> invisible transpose
+    // (OC, B*T) -> (B*T, OC)
+
+
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        if (PRECISION_MODE == PRECISION_FP16) {
+            matmul_triton(pre_gelu, inp, weight, bias, B*T, OC, C, stream, false, true, 0, 0, 0, 0, false, NULL, false);    
+        } else {
+            matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        }
         gelu_forward(out, pre_gelu, B*T*OC, stream);
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        if (PRECISION_MODE == PRECISION_FP16 && use_lp_accumulator) {
+            matmul_triton(out, inp, weight, bias, B*T, OC, C, stream, false, true, 0, 0, 0, 0, false, pre_gelu, false);    
+        } else {
+            matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        }
     }
 }
 
@@ -245,7 +412,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      float* dbias_buffer,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     floatX* pre_gelu=NULL, int gelu_fusion=1, bool use_lp_accumulator=true) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -276,15 +443,65 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
-    matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu : NULL, true);
+    if (PRECISION_MODE == PRECISION_FP16 && use_lp_accumulator && false) { // only respect use_lp_accumulator when OC is the inner dimension where the accumulator matters (eg. vocab size, which is really large and will overflow!)
+        // logical shapes:
+        // weight: (OC, C)
+        // dout: (B*T, OC)
+        // memory layout = row-major, hence physical identical;
+        // (B*T, OC) @ (OC, C) = (B*T, C)
+        // A = (m, k), B = (k, n), C = (m, n)
+        // hence: m=B*T, k=OC, n=C
 
-    // backward GELU (if it wasn't fused into the matmul above)
-    if (gelu_fusion < 2 && pre_gelu) {
-        gelu_backward_inplace(dinp, pre_gelu, B*T*C, stream);
+        matmul_triton(dinp, dout, weight, NULL, B*T, C, OC, stream, false, false, 0, 0, 0, 0, false,
+                    pre_gelu, true);
+    } else {
+        // logical shapes:
+        // weight: (OC, C)
+        // dout: (B*T, OC)
+
+        // memory layout = column-major, hence physical shapes:
+        // weight: (C, OC)
+        // dout: (OC, B*T)
+
+        // (C, OC) @ (OC, B*T) = (C, B*T) in column-major
+
+        // comumn-major output is misinterpreted as row-major -> invisible transpose
+        // (C, B*T) -> (B*T, C)
+
+        matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
+                        gelu_fusion >= 2 ? pre_gelu : NULL, true);
+
+        // backward GELU (if it wasn't fused into the matmul above)
+        if (gelu_fusion < 2 && pre_gelu) {
+            gelu_backward_inplace(dinp, pre_gelu, B*T*C, stream);
+        }
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-    matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, B*T, stream, false, true, 0, 0, 0, 0,
-                    true /* accumulate */, NULL, true);
+
+    if (PRECISION_MODE != PRECISION_FP16) {
+        // logical shapes:
+        // inp: (B*T, C)
+        // dout: (B*T, OC)
+
+        // memory layout = column-major, hence physical shapes:
+        // inp: (C, B*T)
+        // dout: (OC, B*T)
+
+        // (C, B*T) @ (OC, B*T).T = (C, OC) in column-major
+        // comumn-major output is misinterpreted as row-major -> invisible transpose
+        // (C, OC) -> (OC, C)
+        matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, B*T, stream, false, true, 0, 0, 0, 0,
+                        true /* accumulate */, NULL, true);
+    } else {
+        // logical shapes:
+        // inp: (B*T, C)
+        // dout: (B*T, OC)
+        // memory layout = row-major, hence physical identical;
+        // (B*T, OC).T @ (B*T, C) = (OC, C)
+        // A = (m, k), B = (k, n), C = (m, n)
+        // hence: m=OC, k=B*T, n=C
+        matmul_triton(dweight, dout, inp, NULL, OC, C, B*T, stream, true, false, 0, 0, 0, 0, true, NULL, true);
+    }
+
 }

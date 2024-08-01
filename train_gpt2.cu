@@ -70,6 +70,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: multi_gpu_get_shard_offset, multi_gpu_async_reduce_gradient
 #include "llmc/zero.cuh"
 
+#define FP16_GRADIENT_SCALING_FACTOR (1 << 16)
+
 // ----------------------------------------------------------------------------
 // global vars for I/O
 char filename_buffer[512];
@@ -379,7 +381,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     int model_header[256];
     memset(model_header, 0, sizeof(model_header));
     model_header[0] = 20240326; // magic number
-    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
+    
     model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
@@ -401,8 +403,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         // TODO for later perhaps, would require us dynamically converting the
         // model weights from fp32 to fp16 online, here in this function, or writing
         // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
-        fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
-        exit(EXIT_FAILURE);
+        //fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
+        // exit(EXIT_FAILURE);
     }
 
     // read in model from a checkpoint file
@@ -720,8 +722,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
-    cudaCheck(cudaDeviceSynchronize());
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, NULL, model->gelu_fusion, false);
 }
 
 
@@ -732,6 +733,8 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     assert(targets != NULL);
     // forward the model itself
     gpt2_forward(model, inputs, B, T);
+    cudaCheck(cudaDeviceSynchronize());
+    
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
@@ -796,7 +799,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+    float scale_factor = 1.0f;
+    if (PRECISION_MODE == PRECISION_FP16) {
+        scale_factor *= FP16_GRADIENT_SCALING_FACTOR;
+    }
+    const float dloss = scale_factor / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
@@ -816,7 +823,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, NULL, 0, false);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
@@ -904,6 +911,49 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+
+        // debug check all gradients for NaNs
+        if (false) {
+            floatX* const pointers[] = {
+                dl_ln1w, dl_ln1b,
+                dl_qkvw, dl_qkvb,
+                dl_attprojw, dl_attprojb,
+                dl_ln2w, dl_ln2b,
+                dl_fcw, dl_fcb,
+                dl_fcprojw, dl_fcprojb
+            };
+            std::string names[] = {
+                "dl_ln1w", "dl_ln1b",
+                "dl_qkvw", "dl_qkvb",
+                "dl_attprojw", "dl_attprojb",
+                "dl_ln2w", "dl_ln2b",
+                "dl_fcw", "dl_fcb",
+                "dl_fcprojw", "dl_fcprojb"
+            };
+            const size_t nelem[] = {
+                C, C,
+                3 * C * C, 3 * C,
+                C * C, C,
+                C, C,
+                4 * C * C, 4 * C,
+                C * 4 * C, C
+            };
+            for (size_t i = 0; i < sizeof(pointers) / sizeof(pointers[0]); i++) {
+                floatX* host = (floatX*)mallocCheck(nelem[i] * sizeof(floatX));
+                cudaCheck(cudaMemcpy(host, pointers[i], nelem[i] * sizeof(floatX), cudaMemcpyDeviceToHost));
+                for (size_t j = 0; j < nelem[i]; j++) {
+                    if (isnan(__half2float(host[j]))) {
+                        printf("NaN detected in %s[%zu]\n", names[i].c_str(), j);
+                        break;
+                    }
+                    if (isinf(__half2float(host[j]))) {
+                        printf("Inf detected in %s[%zu]\n", names[i].c_str(), j);
+                        break;
+                    }
+                }
+                free(host);
+            }
+        }
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
@@ -1075,7 +1125,6 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                                                      shard.size, tensor.size);
             cudaCheck(cudaGetLastError());
         }
-
         // ok finally call the kernel
         adamw_update(param_ptr, master_ptr, grad_ptr,
                      m_ptr, v_ptr,
@@ -1711,7 +1760,7 @@ int main(int argc, char *argv[]) {
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
             for (int i = 0; i < eval_loader.num_batches; i++) {
-                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                if (i % 10 == 0) { printf0("evaluating HellaSwag: %d/%d\n", i, eval_loader.num_batches); }
                 evalloader_next_batch(&eval_loader);
                 gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
                 int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
@@ -1745,6 +1794,8 @@ int main(int argc, char *argv[]) {
                 // (but even if it wasn't fully identical that's probably not the end of the world)
                 // note this is still somewhat wasteful because we don't have a KV cache!
                 gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
+                cudaCheck(cudaDeviceSynchronize());
+
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
@@ -1809,23 +1860,51 @@ int main(int argc, char *argv[]) {
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
-        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
-        // fetch the next learning rate
-        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+        double model_loss = (double)model.mean_loss;
+
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
-        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
-        // update the model parameters
-        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
-            printf0("skipping update due to loss z-score of %f\n", zloss);
-        } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
-            printf0("skipping update due to grad z-score of %f\n", zgrad);
+
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+
+        float zloss = 0.0f;
+        float zgrad = 0.0f;
+
+        bool should_skip = true;
+        if (!isfinite(model_loss) || isnan(model_loss)) {
+            printf0("skipping update due to nan/infinite loss %f\n", model_loss);
+        } else if (!isfinite(grad_norm) || isnan(grad_norm)) {
+            printf0("skipping update due to nan/infinite grad norm %f\n", grad_norm);
         } else {
-            // clip the gradient norm to a maximum value
-            float grad_clip = 1.0f;
-            float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            // only enter update path if loss and grad_norm are known not to inf/nan propagate into the update_detector
+            zloss = (float)(update_detector(&loss_outlier_detector, model_loss)); // loss z-score
+
+            if (PRECISION_MODE == PRECISION_FP16) {
+                grad_norm /= FP16_GRADIENT_SCALING_FACTOR;
+            }
+
+            zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
+            should_skip = false;
         }
+
+        // update the model parameters
+        if (!should_skip) {
+            if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
+                printf0("skipping update due to loss z-score of %f\n", zloss);
+            } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
+                printf0("skipping update due to grad z-score of %f\n", zgrad);
+            } else {
+                // clip the gradient norm to a maximum value
+                float grad_clip = 1.0f;
+                float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
+                if (PRECISION_MODE == PRECISION_FP16) {
+                    grad_scale /= FP16_GRADIENT_SCALING_FACTOR;
+                }
+                gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            }
+        }
+
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------

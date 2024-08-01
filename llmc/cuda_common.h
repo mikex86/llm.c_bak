@@ -10,6 +10,7 @@ Common utilities for CUDA code.
 #include <string>
 #include <type_traits>      // std::bool_constant
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvtx3/nvToolsExtCudaRt.h>
 #include <cuda_profiler_api.h>
@@ -49,9 +50,23 @@ constexpr std::bool_constant<true> False;
 // Error checking
 
 // CUDA error checking
+// CUDA Runtime API
 inline void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
+    exit(EXIT_FAILURE);
+  }
+};
+
+ // CUDA Driver API
+inline void cudaCheck(CUresult error, const char *file, int line) {
+  if (error != CUDA_SUCCESS) {
+    const char *error_string{};
+    if (cuGetErrorString(error, &error_string) == CUDA_SUCCESS) {
+        printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, error_string);
+    } else {
+        printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, "<unknown error>");
+    }
     exit(EXIT_FAILURE);
   }
 };

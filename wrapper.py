@@ -27,7 +27,10 @@ LLMC_COMMAND_MAPPINGS = {
     "lr_warmup_iters": "-u",
     "checkpoint_every": "-n",
     "resume_optimization": "-y",
-    "load_weights": "-e"
+    "load_weights": "-e",
+    "max_loss_outlier": "-sl",
+    "max_norm_outlier": "-sg",
+    "gelu_fusion": "-ge"
 }
 
 REBUILD_LLMC_SCRIPT = """
@@ -71,9 +74,10 @@ def main():
     else:
         print("train_gpt2cu already compiled, skipping...")
 
+    pynvml.nvmlInit()
+
     # apply overclock
     if config["apply_overclock"]:
-        pynvml.nvmlInit()
         for gpu_name, overclock in config["overclocks"].items():
             # apply overclock to gpus with the specified name
             for i in range(pynvml.nvmlDeviceGetCount()):
@@ -86,8 +90,19 @@ def main():
                     try:
                         pynvml.nvmlDeviceSetGpcClkVfOffset(handle, core_mhz_plus)
                         pynvml.nvmlDeviceSetMemClkVfOffset(handle, mem_mhz_plus)
-                    except Exception as e:
+                    except pynvml.NVMLError as e:
                         print(f"Failed to apply overclock to {gpu_name}: {e}")
+   
+    # force fan speed to 100%
+    for i in range(pynvml.nvmlDeviceGetCount()):
+        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+        # iterate over all fans
+        fan_count = pynvml.nvmlDeviceGetNumFans(handle)
+        for fan_index in range(fan_count):
+            try:
+                pynvml.nvmlDeviceSetFanSpeed_v2(handle, fan_index, 100)
+            except pynvml.NVMLError as err:
+                print(f"Failed to set fan speed of fan {fan_index} of GPU {i} to 100%")
 
     # create log dir
     log_dir = config["out_dir"]
