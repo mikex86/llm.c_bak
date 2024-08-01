@@ -5,3 +5,6 @@ tiktoken
 transformers
 datasets
 requests
+wandb
+pynvml
+regex
