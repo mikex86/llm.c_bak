@@ -6,4 +6,4 @@ if [ ! -d "venv" ]; then
 fi
 
 
-sudo venv/bin/python wrapper.py "$@"
+venv/bin/python wrapper.py "$@"

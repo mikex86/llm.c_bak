@@ -18,9 +18,13 @@
   "resume_optimization": 1,
   "load_weights": "d12",
   "wandb_project": "gpt2_124M_llm.c",
-  "compile_no_multi_gpu": true,
-  "num_gpus": 1,
   "compile_use_cudnn": true,
+  "enable_wandb": false,
+  "fp_precision": "FP16",
+  "max_loss_outlier": 3.0,
+  "max_norm_outlier": 3.0,
+  "gelu_fusion": 2,
+  
   "apply_overclock": true,
   "overclocks": {
     "NVIDIA GeForce RTX 4090": {
@@ -28,9 +32,14 @@
       "mem_mhz+": 0
     }
   },
-  "enable_wandb": true,
-  "fp_precision": "FP16",
-  "max_loss_outlier": 3.0,
-  "max_norm_outlier": 3.0,
-  "gelu_fusion": 2
+  "compile_no_multi_gpu": false,
+  "num_total_gpus": 2,
+  "nodes": {
+    "10.1.1.61": {
+      "num_gpus": 1
+    },
+    "10.1.1.67:1": {
+      "num_gpus": 1
+    }
+  }
 }

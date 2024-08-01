@@ -1,6 +1,5 @@
 import json
 import os
-import io
 import regex as re
 import pynvml
 from subprocess import PIPE
@@ -41,7 +40,7 @@ make train_gpt2cu
 """
 
 
-FORCE_RECOMPILE_LLMC = False
+FORCE_RECOMPILE_LLMC = True
 
 def main():
     # argparse json run config path
@@ -112,12 +111,23 @@ def main():
     if config["compile_no_multi_gpu"]:
         command = ["./train_gpt2cu"]
     else:
-        command = ['mpirun', '-np', str(config['num_gpus']), './train_gpt2cu']
+        host_str = ""
+        for node_name, node_config in config["nodes"].items():
+            num_gpus = node_config["num_gpus"]
+
+            if len(host_str) > 0:
+                host_str += ","
+            host_str += f"{node_name}:{num_gpus}"
+        
+        command = ['mpirun', '-np', str(config['num_total_gpus']), "--host", host_str, './train_gpt2cu']
     
     for key, value in config.items():
         if key in LLMC_COMMAND_MAPPINGS:
             command.append(LLMC_COMMAND_MAPPINGS[key])
             command.append(str(value))
+
+    if not config["compile_no_multi_gpu"]:
+        command.extend(["-pi", "mpi"])
 
     enable_wandb = config.get("enable_wandb", False)
 
