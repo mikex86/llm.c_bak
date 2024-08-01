@@ -912,49 +912,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
 
-        // debug check all gradients for NaNs
-        if (false) {
-            floatX* const pointers[] = {
-                dl_ln1w, dl_ln1b,
-                dl_qkvw, dl_qkvb,
-                dl_attprojw, dl_attprojb,
-                dl_ln2w, dl_ln2b,
-                dl_fcw, dl_fcb,
-                dl_fcprojw, dl_fcprojb
-            };
-            std::string names[] = {
-                "dl_ln1w", "dl_ln1b",
-                "dl_qkvw", "dl_qkvb",
-                "dl_attprojw", "dl_attprojb",
-                "dl_ln2w", "dl_ln2b",
-                "dl_fcw", "dl_fcb",
-                "dl_fcprojw", "dl_fcprojb"
-            };
-            const size_t nelem[] = {
-                C, C,
-                3 * C * C, 3 * C,
-                C * C, C,
-                C, C,
-                4 * C * C, 4 * C,
-                C * 4 * C, C
-            };
-            for (size_t i = 0; i < sizeof(pointers) / sizeof(pointers[0]); i++) {
-                floatX* host = (floatX*)mallocCheck(nelem[i] * sizeof(floatX));
-                cudaCheck(cudaMemcpy(host, pointers[i], nelem[i] * sizeof(floatX), cudaMemcpyDeviceToHost));
-                for (size_t j = 0; j < nelem[i]; j++) {
-                    if (isnan(__half2float(host[j]))) {
-                        printf("NaN detected in %s[%zu]\n", names[i].c_str(), j);
-                        break;
-                    }
-                    if (isinf(__half2float(host[j]))) {
-                        printf("Inf detected in %s[%zu]\n", names[i].c_str(), j);
-                        break;
-                    }
-                }
-                free(host);
-            }
-        }
-
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
             floatX* const pointers[] = {
