@@ -1636,7 +1636,7 @@ int main(int argc, char *argv[]) {
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
     // set up logging
-    if (multi_gpu_config.process_rank == 0) { create_dir_if_not_exists(output_log_dir); }
+    create_dir_if_not_exists(output_log_dir);
     Logger logger;
     logger_init(&logger, output_log_dir, multi_gpu_config.process_rank, resume);
 
