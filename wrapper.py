@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import regex as re
 import pynvml
 from subprocess import PIPE
@@ -72,6 +73,17 @@ def main():
         print("Finished compiling llm.c")
     else:
         print("train_gpt2cu already compiled, skipping...")
+
+    # if multi-node, copy to all other nodes
+    if not config["compile_no_multi_gpu"]:
+        for node_host, node_config in config["nodes"].items():
+            if node_config.get("is_master", False):
+                continue
+            
+            # copy ./train_gpt2cu to all other nodes
+            abs_path = os.path.abspath("./train_gpt2cu")
+            print(f"Copying {abs_path} to {node_host}...")
+            os.system(f"scp {abs_path} {node_host}:{abs_path}")
 
     pynvml.nvmlInit()
 

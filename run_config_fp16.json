@@ -1,7 +1,7 @@
 {
-  "train_file": "/media/mike/NVME2/fineweb100B/fineweb_train_*.bin",
-  "dev_file": "/media/mike/NVME2/fineweb100B/fineweb_val_*.bin",
-  "out_dir": "/media/mike/NVME2/log_gpt2_124M_fp16_3",
+  "train_file": "/mnt/dataset/fineweb_train_*.bin",
+  "dev_file": "/mnt/dataset/fineweb_val_*.bin",
+  "out_dir": "./log_gpt2_124M_fp16",
   "val_loss_every": 250,
   "sample_every": 20000,
   "num_tokens_to_sample": 144,
@@ -19,7 +19,7 @@
   "load_weights": "d12",
   "wandb_project": "gpt2_124M_llm.c",
   "compile_use_cudnn": true,
-  "enable_wandb": false,
+  "enable_wandb": true,
   "fp_precision": "FP16",
   "max_loss_outlier": 3.0,
   "max_norm_outlier": 3.0,
@@ -35,10 +35,11 @@
   "compile_no_multi_gpu": false,
   "num_total_gpus": 2,
   "nodes": {
-    "10.1.1.61": {
+    "10.1.1.67": {
+      "is_master": true,
       "num_gpus": 1
     },
-    "10.1.1.67:1": {
+    "10.1.1.61": {
       "num_gpus": 1
     }
   }
